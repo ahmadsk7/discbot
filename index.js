@@ -79,11 +79,7 @@ client.on('guildMemberAdd', async (member) => {
 
       const token = jwt.sign({ discordId: member.id }, JWT_SECRET, { expiresIn: '24h' });
       const url = `https://arena.build?token=${token}`; // replace with direct Tally link if preferred
-
-      const dmMessage =
-        `Welcome! To get verified, please fill out this quick form:\n${url}\n\n` +
-        `If your DMs are off, enable them or run /verify in the server.`;
-
+      const dmMessage = `🔗 [Click here to fill out the form](${url})\n\nOnce you submit, you'll be verified.`;
       await member.send({ content: dmMessage }).catch(() => {});
     }
   } catch (e) {
