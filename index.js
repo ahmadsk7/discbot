@@ -71,11 +71,20 @@ client.on('guildMemberAdd', async (member) => {
     });
 
     if (usedCode === ARENA_INVITE_CODE) {
-      // arena.build path → give Verified (sees prelim channels)
+      // arena.build path → give Verified (sees prelim channels) and skip DM
       await member.roles.add(VERIFIED_ROLE_ID).catch(() => {});
     } else {
-      // vanity/public path → lock to #join-to-verify
+      // vanity/public path → Unverified + DM verification link
       await member.roles.add(UNVERIFIED_ROLE_ID).catch(() => {});
+
+      const token = jwt.sign({ discordId: member.id }, JWT_SECRET, { expiresIn: '24h' });
+      const url = `https://arena.build?token=${token}`; // replace with direct Tally link if preferred
+
+      const dmMessage =
+        `Welcome! To get verified, please fill out this quick form:\n${url}\n\n` +
+        `If your DMs are off, enable them or run /verify in the server.`;
+
+      await member.send({ content: dmMessage }).catch(() => {});
     }
   } catch (e) {
     console.error('guildMemberAdd error', e);
