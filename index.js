@@ -3,6 +3,7 @@ const { Client, GatewayIntentBits, Partials, REST, Routes } = require('discord.j
 const express = require('express');
 const bodyParser = require('body-parser');
 const jwt = require('jsonwebtoken');
+const https = require('https'); // <-- [ADDED] for keep-alive pings
 
 const {
   DISCORD_TOKEN, GUILD_ID,
@@ -239,7 +240,68 @@ app.post('/form-webhook', async (req, res) => {
   }
 });
 
+/* -------------------- [ADDED] Fast-ACK webhook endpoint -------------------- */
+app.post('/form-webhook-fast', (req, res) => {
+  // ACK immediately to avoid CloudFront/Zapier 504s on cold starts
+  res.status(200).send('ok');
+
+  // Process asynchronously
+  (async () => {
+    try {
+      console.log('[webhook-fast] body:', JSON.stringify(req.body));
+
+      const discordIdFromZap = req.body?.discord_id;
+      const token =
+        req.body?.hidden?.token ||
+        req.body?.data?.hidden?.token ||
+        req.body?.fields?.token ||
+        req.body?.token;
+
+      console.log('[webhook-fast] discordIdFromZap:', discordIdFromZap, ' token?', Boolean(token));
+
+      const discordId =
+        discordIdFromZap ||
+        (token ? jwt.verify(token, JWT_SECRET).discordId : null);
+
+      console.log('[webhook-fast] resolved discordId:', discordId);
+      if (!discordId) { console.warn('[webhook-fast] ❌ No discord id'); return; }
+
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const member = await guild.members.fetch(discordId).catch(e => {
+        console.error('[webhook-fast] fetch member failed:', e?.message);
+        return null;
+      });
+      if (!member) { console.warn('[webhook-fast] ❌ Member not in guild'); return; }
+
+      await member.roles.remove(UNVERIFIED_ROLE_ID).catch(e =>
+        console.warn('[webhook-fast] remove Unverified:', e?.message)
+      );
+      await safeAddRole(member, VERIFIED_ROLE_ID, 'Verified (form)');
+      console.log('[webhook-fast] ✅ Verified via form:', member.user.tag);
+    } catch (e) {
+      console.error('[webhook-fast] handler error:', e);
+    }
+  })();
+});
+/* -------------------------------------------------------------------------- */
+
 app.get('/', (_, res) => res.send('OK'));
 app.listen(PORT, () => console.log(`Webhook listening on :${PORT}`));
+
+/* -------------------- [ADDED] Keep-alive self-ping for Render -------------- */
+const PUBLIC_URL =
+  process.env.RENDER_EXTERNAL_URL ||  // set automatically on Render
+  process.env.KEEPALIVE_URL ||        // optional manual override
+  '';
+
+if (PUBLIC_URL) {
+  setInterval(() => {
+    try { https.get(PUBLIC_URL, () => {}); } catch {}
+  }, 4 * 60 * 1000); // every 4 minutes
+  dlog('[keepalive] pinging', PUBLIC_URL);
+} else {
+  dlog('[keepalive] no PUBLIC_URL set; skipping self-ping');
+}
+/* -------------------------------------------------------------------------- */
 
 client.login(DISCORD_TOKEN);
