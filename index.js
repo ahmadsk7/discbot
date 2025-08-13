@@ -82,6 +82,22 @@ client.once('ready', async () => {
   }
 });
 
+// --- Connection diagnostics (ADDED) ---
+client.on('shardReady', (id, unavailableGuilds) => {
+  dlog(`[shard] READY id=${id} unavailableGuilds=${unavailableGuilds?.size ?? 0}`);
+});
+client.on('shardReconnecting', (id) => dlog(`[shard] RECONNECTING id=${id}`));
+client.on('shardResume', (id, replayed) => dlog(`[shard] RESUMED id=${id} events=${replayed}`));
+client.on('shardDisconnect', (event, id) => {
+  console.warn(`[shard] DISCONNECT id=${id} code=${event?.code} reason=${event?.reason || ''}`);
+});
+client.on('warn', (m) => console.warn('[client] warn', m));
+client.on('error', (err) => console.error('[client] error', err?.message || err));
+setInterval(() => {
+  const s = client.ws?.status;
+  dlog('[heartbeat] ws.status=', s, 'uptime(min)=', Math.floor(process.uptime()/60));
+}, 5 * 60 * 1000);
+
 client.on('guildMemberAdd', async (member) => {
   dlog('[join] member:', member.user.tag, 'id=', member.id, 'pending=', member.pending);
   try {
@@ -177,9 +193,6 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-/**
- * NEW: Give Member role when a VERIFIED user posts in #introductions
- */
 client.on('messageCreate', async (message) => {
   try {
     if (!message.guild) return;
@@ -189,7 +202,6 @@ client.on('messageCreate', async (message) => {
     const member = await message.guild.members.fetch(message.author.id).catch(() => null);
     if (!member) return;
 
-    // Must be Verified, and not already a Member
     const isVerified = member.roles.cache.has(VERIFIED_ROLE_ID);
     const isMember   = member.roles.cache.has(MEMBER_ROLE_ID);
     if (!isVerified) { dlog('[intro] user not Verified, ignoring'); return; }
@@ -211,12 +223,26 @@ client.on('messageCreate', async (message) => {
 const app = express();
 app.use(bodyParser.json());
 
+app.get('/_status', async (_, res) => {
+  try {
+    const inGuild = client.guilds.cache.has(GUILD_ID);
+    const guild = inGuild ? client.guilds.cache.get(GUILD_ID) : null;
+    res.json({
+      up: true,
+      wsStatus: client.ws?.status,
+      loggedInAs: client.user ? `${client.user.tag} (${client.user.id})` : null,
+      guildId: GUILD_ID,
+      inGuild,
+      guildName: guild?.name || null,
+      time: new Date().toISOString()
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 app.post('/form-webhook', async (req, res) => {
   try {
-    // Debug what Zapier/Tally sends (uncomment if needed)
-    // console.log('[webhook] headers:', req.headers);
-    // console.log('[webhook] body:', JSON.stringify(req.body));
-
     const discordIdFromZap = req.body?.discord_id;
     const token =
       req.body?.hidden?.token ||
@@ -240,39 +266,29 @@ app.post('/form-webhook', async (req, res) => {
   }
 });
 
-/* -------------------- [ADDED] Fast-ACK webhook endpoint -------------------- */
 app.post('/form-webhook-fast', (req, res) => {
-  // ACK immediately to avoid CloudFront/Zapier 504s on cold starts
   res.status(200).send('ok');
-
-  // Process asynchronously
   (async () => {
     try {
       console.log('[webhook-fast] body:', JSON.stringify(req.body));
-
       const discordIdFromZap = req.body?.discord_id;
       const token =
         req.body?.hidden?.token ||
         req.body?.data?.hidden?.token ||
         req.body?.fields?.token ||
         req.body?.token;
-
       console.log('[webhook-fast] discordIdFromZap:', discordIdFromZap, ' token?', Boolean(token));
-
       const discordId =
         discordIdFromZap ||
         (token ? jwt.verify(token, JWT_SECRET).discordId : null);
-
       console.log('[webhook-fast] resolved discordId:', discordId);
       if (!discordId) { console.warn('[webhook-fast] ❌ No discord id'); return; }
-
       const guild = await client.guilds.fetch(GUILD_ID);
       const member = await guild.members.fetch(discordId).catch(e => {
         console.error('[webhook-fast] fetch member failed:', e?.message);
         return null;
       });
       if (!member) { console.warn('[webhook-fast] ❌ Member not in guild'); return; }
-
       await member.roles.remove(UNVERIFIED_ROLE_ID).catch(e =>
         console.warn('[webhook-fast] remove Unverified:', e?.message)
       );
@@ -283,25 +299,21 @@ app.post('/form-webhook-fast', (req, res) => {
     }
   })();
 });
-/* -------------------------------------------------------------------------- */
 
 app.get('/', (_, res) => res.send('OK'));
 app.listen(PORT, () => console.log(`Webhook listening on :${PORT}`));
 
-/* -------------------- [ADDED] Keep-alive self-ping for Render -------------- */
 const PUBLIC_URL =
-  process.env.RENDER_EXTERNAL_URL ||  // set automatically on Render
-  process.env.KEEPALIVE_URL ||        // optional manual override
+  process.env.RENDER_EXTERNAL_URL ||
+  process.env.KEEPALIVE_URL ||
   '';
-
 if (PUBLIC_URL) {
   setInterval(() => {
     try { https.get(PUBLIC_URL, () => {}); } catch {}
-  }, 4 * 60 * 1000); // every 4 minutes
+  }, 4 * 60 * 1000);
   dlog('[keepalive] pinging', PUBLIC_URL);
 } else {
   dlog('[keepalive] no PUBLIC_URL set; skipping self-ping');
 }
-/* -------------------------------------------------------------------------- */
 
 client.login(DISCORD_TOKEN);
