@@ -316,4 +316,15 @@ if (PUBLIC_URL) {
   dlog('[keepalive] no PUBLIC_URL set; skipping self-ping');
 }
 
-client.login(DISCORD_TOKEN);
+// sanity before login
+if (!DISCORD_TOKEN) {
+  console.error('[login] ❌ DISCORD_TOKEN is missing in env');
+}
+if (!GUILD_ID) {
+  console.error('[login] ❌ GUILD_ID is missing in env');
+}
+
+// make login outcome explicit
+client.login(DISCORD_TOKEN)
+  .then(() => console.log('[login] ✅ success'))
+  .catch((e) => console.error('[login] ❌ failed:', e && (e.code || e.message || e)));
