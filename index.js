@@ -1,6 +1,4 @@
 require('dotenv').config();
-console.log('PORT from .env:', process.env.PORT);
-
 const { Client, GatewayIntentBits, Partials, REST, Routes } = require('discord.js');
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -8,10 +6,22 @@ const jwt = require('jsonwebtoken');
 
 const {
   DISCORD_TOKEN, GUILD_ID,
-  UNVERIFIED_ROLE_ID, VERIFIED_ROLE_ID,
+  UNVERIFIED_ROLE_ID, VERIFIED_ROLE_ID, MEMBER_ROLE_ID,
+  INTRO_CHANNEL_ID, LOG_CHANNEL_ID,
   JWT_SECRET, PORT,
-  MEMBER_ROLE_ID, INTRO_CHANNEL_ID, ARENA_INVITE_CODE
+  ARENA_INVITE_CODE, DEBUG
 } = process.env;
+
+const invitesCache = new Map();
+function dlog(...args) { if (String(DEBUG).toLowerCase() === 'true') console.log('[DEBUG]', ...args); }
+
+async function safeAddRole(member, roleId, label) {
+  dlog('safeAddRole ->', label, 'roleId=', roleId);
+  if (!roleId) throw new Error(`Missing roleId for ${label}`);
+  if (member.roles.cache.has(roleId)) { dlog('already has', label); return; }
+  await member.roles.add(roleId);
+  dlog('added', label, 'to', member.user.tag);
+}
 
 const client = new Client({
   intents: [
@@ -25,93 +35,113 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message, Partials.Reaction]
 });
 
-const skipDM = new Set();
-const TARGET_MESSAGE_ID = '1403162481358012630';
-const TARGET_EMOJI = '✅';
-
-// track invite uses so we know which invite was used on join
-const invitesCache = new Map();
-
-// ---------- READY ----------
-const commands = [{ name: 'verify', description: 'DMs you the verification form link' }];
-
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // register slash command
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-  await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body: commands });
+  await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), {
+    body: [
+      { name: 'verify', description: 'DMs you the verification form link' },
+      { name: 'role_debug', description: 'Try adding Unverified/Verified to you and report errors' }
+    ]
+  });
 
-  // seed invite cache
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
-    const invites = await guild.invites.fetch();
-    invites.forEach(inv => invitesCache.set(inv.code, inv.uses ?? 0));
+    dlog('Guild:', guild.name, guild.id);
+
+    try {
+      const invites = await guild.invites.fetch();
+      invites.forEach(inv => invitesCache.set(inv.code, inv.uses ?? 0));
+      dlog('Seeded invites cache:', [...invitesCache.entries()]);
+    } catch (e) {
+      console.warn('[ready] invites.fetch failed:', e?.message);
+    }
+
+    const me = await guild.members.fetchMe();
+    const botTopRole = me.roles.highest;
+    dlog('Bot top role:', botTopRole?.name, botTopRole?.position);
+
+    const unver = guild.roles.cache.get(UNVERIFIED_ROLE_ID);
+    const ver = guild.roles.cache.get(VERIFIED_ROLE_ID);
+    const mem = guild.roles.cache.get(MEMBER_ROLE_ID);
+    dlog('Unverified role:', unver?.name, unver?.position, UNVERIFIED_ROLE_ID);
+    dlog('Verified role:', ver?.name, ver?.position, VERIFIED_ROLE_ID);
+    dlog('Member role:', mem?.name, mem?.position, MEMBER_ROLE_ID);
+
+    if (!me.permissions.has('ManageRoles')) console.warn('⚠️ Bot lacks Manage Roles');
+    if (!me.permissions.has('ManageGuild')) console.warn('⚠️ Bot lacks Manage Guild');
+    const tooLow =
+      botTopRole?.position <= (unver?.position ?? -1) ||
+      botTopRole?.position <= (ver?.position ?? -1) ||
+      botTopRole?.position <= (mem?.position ?? -1);
+    if (tooLow) console.warn('⚠️ Bot role must be ABOVE Unverified/Verified/Member');
   } catch (e) {
-    console.error('ready invite cache error', e);
+    console.error('[ready] error:', e);
   }
 });
 
-// keep cache fresh when new invites are created
-client.on('inviteCreate', (inv) => {
-  invitesCache.set(inv.code, inv.uses ?? 0);
-});
-
-// ---------- MEMBER JOIN ----------
 client.on('guildMemberAdd', async (member) => {
+  dlog('[join] member:', member.user.tag, 'id=', member.id, 'pending=', member.pending);
   try {
-    const invites = await member.guild.invites.fetch();
-    let usedCode = null;
+    if (member.pending) {
+      dlog('[join] pending; will add role after acceptance.');
+      return;
+    }
 
-    invites.forEach(inv => {
-      const prev = invitesCache.get(inv.code) ?? 0;
-      const now = inv.uses ?? 0;
-      if (now > prev) usedCode = inv.code;
-      invitesCache.set(inv.code, now);
-    });
+    let usedCode = null;
+    try {
+      const invites = await member.guild.invites.fetch();
+      invites.forEach(inv => {
+        const prev = invitesCache.get(inv.code) ?? 0;
+        const now  = inv.uses ?? 0;
+        if (now > prev) usedCode = inv.code;
+        invitesCache.set(inv.code, now);
+      });
+      dlog('[join] usedCode:', usedCode);
+    } catch (e) {
+      console.warn('[join] invites.fetch failed:', e?.message);
+    }
+
+    await safeAddRole(member, UNVERIFIED_ROLE_ID, 'Unverified');
 
     if (usedCode === ARENA_INVITE_CODE) {
-      // arena.build path → give Verified (sees prelim channels) and skip DM
-      await member.roles.add(VERIFIED_ROLE_ID).catch(() => {});
+      dlog('[join] matches ARENA_INVITE_CODE => upgrading to Verified');
+      try { await member.roles.remove(UNVERIFIED_ROLE_ID); } catch {}
+      await safeAddRole(member, VERIFIED_ROLE_ID, 'Verified (invite)');
     } else {
-      // vanity/public path → Unverified + DM verification link
-      await member.roles.add(UNVERIFIED_ROLE_ID).catch(() => {});
-
+      dlog('[join] non-special invite => DM token link');
       const token = jwt.sign({ discordId: member.id }, JWT_SECRET, { expiresIn: '24h' });
-      const url = `https://arena.build?token=${token}`; // replace with direct Tally link if preferred
-      const dmMessage = `🔗 [Click here to fill out the form](${url})\n\nOnce you submit, you'll be verified.`;
-      await member.send({ content: dmMessage }).catch(() => {});
+      const url = `https://arena.build?token=${token}`;
+      try {
+        await member.send(
+          `Thanks for verifying!\n\n🔗 [Click here to fill out the form](${url})\n\nLet us know if you run into any issues!`
+        );
+      } catch (e) {
+        console.warn('[join] DM failed (user DMs closed):', e?.message);
+      }
     }
   } catch (e) {
-    console.error('guildMemberAdd error', e);
+    console.error('guildMemberAdd error:', e);
   }
 });
 
-// ---------- REACTION → DM VERIFY LINK (optional helper) ----------
-client.on('messageReactionAdd', async (reaction, user) => {
-  if (user.bot) return;
+client.on('guildMemberUpdate', async (oldM, newM) => {
   try {
-    if (reaction.partial) await reaction.fetch();
-    if (reaction.message.partial) await reaction.message.fetch();
-
-    if (reaction.message.id !== TARGET_MESSAGE_ID || reaction.emoji.name !== TARGET_EMOJI) return;
-
-    const guild = reaction.message.guild;
-    const member = await guild.members.fetch(user.id);
-
-    const token = jwt.sign({ discordId: member.id }, JWT_SECRET, { expiresIn: '24h' });
-    const url = `https://tally.so/r/mOkk2Y?token=${token}`;
-
-    const msg = `Thanks for verifying!\n\n🔗 [Click here to fill out the form](${url})\n\nLet us know if you run into any issues!`;
-    await member.send({ content: msg }).catch(() => {});
+    if (oldM.pending && !newM.pending) {
+      dlog('[screening] accepted rules:', newM.user.tag);
+      const hasUnver = newM.roles.cache.has(UNVERIFIED_ROLE_ID);
+      const hasVer   = newM.roles.cache.has(VERIFIED_ROLE_ID);
+      if (!hasUnver && !hasVer) await safeAddRole(newM, UNVERIFIED_ROLE_ID, 'Unverified (post-screening)');
+    }
   } catch (e) {
-    console.error('reaction error', e);
+    console.error('guildMemberUpdate error:', e);
   }
 });
 
-// ---------- /verify (optional helper) ----------
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
+
   if (interaction.commandName === 'verify') {
     const token = jwt.sign({ discordId: interaction.user.id }, JWT_SECRET, { expiresIn: '24h' });
     const url = `https://arena.build/form?token=${token}`;
@@ -125,18 +155,68 @@ client.on('interactionCreate', async (interaction) => {
       });
     }
   }
+
+  if (interaction.commandName === 'role_debug') {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const member = await guild.members.fetch(interaction.user.id);
+
+      dlog('[role_debug] running for', member.user.tag);
+
+      await safeAddRole(member, UNVERIFIED_ROLE_ID, 'Unverified');
+      try { await member.roles.remove(UNVERIFIED_ROLE_ID); } catch {}
+      await safeAddRole(member, VERIFIED_ROLE_ID, 'Verified');
+
+      await interaction.editReply('✅ Role debug succeeded: Unverified → Verified. Check server roles + console logs.');
+    } catch (e) {
+      console.error('[role_debug] error:', e);
+      await interaction.editReply('❌ Role debug failed. See console for error.');
+    }
+  }
 });
 
-// ---------- WEBHOOK: form submissions (public/vanity path) ----------
+/**
+ * NEW: Give Member role when a VERIFIED user posts in #introductions
+ */
+client.on('messageCreate', async (message) => {
+  try {
+    if (!message.guild) return;
+    if (message.author.bot) return;
+    if (!INTRO_CHANNEL_ID || message.channel.id !== INTRO_CHANNEL_ID) return;
+
+    const member = await message.guild.members.fetch(message.author.id).catch(() => null);
+    if (!member) return;
+
+    // Must be Verified, and not already a Member
+    const isVerified = member.roles.cache.has(VERIFIED_ROLE_ID);
+    const isMember   = member.roles.cache.has(MEMBER_ROLE_ID);
+    if (!isVerified) { dlog('[intro] user not Verified, ignoring'); return; }
+    if (isMember) { dlog('[intro] already has Member'); return; }
+
+    await safeAddRole(member, MEMBER_ROLE_ID, 'Member (introductions)');
+
+    if (LOG_CHANNEL_ID) {
+      const ch = message.guild.channels.cache.get(LOG_CHANNEL_ID);
+      if (ch && ch.isTextBased()) {
+        ch.send(`👤 ${member} just got the <@&${MEMBER_ROLE_ID}> role for introducing themselves.`).catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.error('messageCreate intro error', e);
+  }
+});
+
 const app = express();
 app.use(bodyParser.json());
 
 app.post('/form-webhook', async (req, res) => {
   try {
-    // Prefer direct discord_id (from Tally Discord login via Zapier)
-    const discordIdFromZap = req.body?.discord_id;
+    // Debug what Zapier/Tally sends (uncomment if needed)
+    // console.log('[webhook] headers:', req.headers);
+    // console.log('[webhook] body:', JSON.stringify(req.body));
 
-    // Fallback: JWT token (for /verify or reaction link flow)
+    const discordIdFromZap = req.body?.discord_id;
     const token =
       req.body?.hidden?.token ||
       req.body?.data?.hidden?.token ||
@@ -149,11 +229,10 @@ app.post('/form-webhook', async (req, res) => {
     const guild = await client.guilds.fetch(GUILD_ID);
     const member = await guild.members.fetch(discordId);
 
-    // swap Unverified → Verified
     await member.roles.remove(UNVERIFIED_ROLE_ID).catch(() => {});
-    await member.roles.add(VERIFIED_ROLE_ID).catch(() => {});
+    await safeAddRole(member, VERIFIED_ROLE_ID, 'Verified (form)');
 
-    return res.sendStatus(200);
+    return res.status(200).send('ok');
   } catch (e) {
     console.error('webhook error', e, req.body);
     return res.sendStatus(200);
